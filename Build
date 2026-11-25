@@ -1,0 +1,100 @@
+/**
+ * build.common.gradle
+ *
+ * Configuração de build comum aos aplicativos do FTC SDK.
+ * Evite editar este arquivo, pois atualizações do SDK podem sobrescrevê-lo.
+ * Faça suas personalizações no build.gradle do TeamCode.
+ *
+ * Cada módulo carrega este arquivo com:
+ *
+ *      apply from: '../build.common.gradle'
+ */
+
+import java.util.regex.Pattern
+
+android {
+
+    compileSdk 34   // versão da API Android usada para compilar
+
+    // Chaves usadas para assinar o APK
+    signingConfigs {
+        release {
+            // Usa a chave definida nas variáveis de ambiente; sem elas, usa a de debug
+            def apkStoreFile = System.getenv("APK_SIGNING_STORE_FILE")
+            if (apkStoreFile != null) {
+                keyAlias System.getenv("APK_SIGNING_KEY_ALIAS")
+                keyPassword System.getenv("APK_SIGNING_KEY_PASSWORD")
+                storeFile file(System.getenv("APK_SIGNING_STORE_FILE"))
+                storePassword System.getenv("APK_SIGNING_STORE_PASSWORD")
+            } else {
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+                storeFile rootProject.file('libs/ftc.debug.keystore')
+                storePassword 'android'
+            }
+        }
+
+        debug {
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+            storeFile rootProject.file('libs/ftc.debug.keystore')
+            storePassword 'android'
+        }
+    }
+
+    defaultConfig {
+        signingConfig signingConfigs.debug
+        applicationId 'com.qualcomm.ftcrobotcontroller'
+        minSdkVersion 24            // versão mínima do Android no dispositivo
+        //noinspection ExpiredTargetSdkVersion
+        targetSdkVersion 28
+
+        // Lê versionCode e versionName do AndroidManifest.xml do FtcRobotController,
+        // para manter a versão do app sincronizada com a do SDK
+        def manifestFile = project(':FtcRobotController').file('src/main/AndroidManifest.xml');
+        def manifestText = manifestFile.getText()
+        //
+        def vCodePattern = Pattern.compile("versionCode=\"(\\d+(\\.\\d+)*)\"")
+        def matcher = vCodePattern.matcher(manifestText)
+        matcher.find()
+        def vCode = Integer.parseInt(matcher.group(1))
+        //
+        def vNamePattern = Pattern.compile("versionName=\"(.*)\"")
+        matcher = vNamePattern.matcher(manifestText);
+        matcher.find()
+        def vName = matcher.group(1)
+        //
+        versionCode vCode
+        versionName vName
+    }
+
+    // http://google.github.io/android-gradle-dsl/current/com.android.build.gradle.internal.dsl.BuildType.html
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+
+            // Arquiteturas ARM incluídas no APK (32 e 64 bits)
+            ndk {
+                abiFilters "armeabi-v7a", "arm64-v8a"
+            }
+        }
+        debug {
+            debuggable true       // permite depurar o código Java
+            jniDebuggable true    // permite depurar o código nativo
+            ndk {
+                abiFilters "armeabi-v7a", "arm64-v8a"
+            }
+        }
+    }
+
+    // Nível de linguagem Java do projeto
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    ndkVersion '21.3.6528147'
+}
+
+repositories {
+}
