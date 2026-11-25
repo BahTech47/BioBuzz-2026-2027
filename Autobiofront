@@ -1,0 +1,712 @@
+package org.firstinspires.ftc.teamcode.Auto;
+
+import com.qualcomm.hardware.gobilda.GoBildaPinpointDriver;
+import com.qualcomm.hardware.limelightvision.LLResult;
+import com.qualcomm.hardware.limelightvision.LLResultTypes;
+import com.qualcomm.hardware.limelightvision.Limelight3A;
+import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.Servo;
+import com.qualcomm.robotcore.util.ElapsedTime;
+
+import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
+import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
+import org.firstinspires.ftc.robotcore.external.navigation.Pose2D;
+
+/**
+ * Autônomo SEM Pedro Pathing.
+ * - Posição: pods de odometria (goBILDA Pinpoint), em polegadas e graus.
+ * - Movimento: PID próprio até um ponto (x, y, heading) do campo.
+ * - Mira: função de alinhamento por AprilTag (Limelight), hoje desativada no fluxo.
+ * - Fluxo ativo: LAUNCH -> COLETA -> GO_POINT2_START -> GO_POINT2 -> DONE.
+ */
+@Autonomous(name = "AutoBioFront", group = "BahTech")
+public class AutoBioFront extends LinearOpMode {
+
+    // ------------------ ESTADOS ------------------
+    private enum State {
+        ALIGN,          // trava de mira com a Limelight
+
+        LAUNCH,
+        LAUNCH2,
+
+        COLETA,
+        GO_POINT2_START,
+        GO_POINT2,
+        GO_POINT3_START,
+        GO_POINT3,
+        DONE
+    }
+
+    private State state = State.ALIGN;   // substituído por LAUNCH logo após o start
+    private final ElapsedTime stateTimer = new ElapsedTime();   // tempo dentro do estado atual
+    private final ElapsedTime stepTimer = new ElapsedTime();    // tempo dentro de cada etapa do lançamento
+    private final ElapsedTime alignHoldTimer = new ElapsedTime(); // tempo contínuo dentro da tolerância
+    private int launchStep = 0;
+    private int launchStep2 = 0;
+
+    private int Colectstep = 0;
+
+    // ------------------ PONTOS DO CAMPO (x pol, y pol, heading graus) ------------------
+    private static class Waypoint {
+        final double x, y, heading;
+
+        Waypoint(double x, double y, double heading) {
+            this.x = x;
+            this.y = y;
+            this.heading = heading;
+        }
+    }
+
+    private final Waypoint START = new Waypoint(0, 0, 0);
+    private final Waypoint POINT1 = new Waypoint(5,30 , 0);
+    private final Waypoint POINT2_START = new Waypoint(5,30 , 0);
+    private final Waypoint POINT2 = new Waypoint(100, 65, 0);
+
+    // Rota alternativa (desativada)
+//    private final Waypoint START = new Waypoint(0, 0, 0);
+//    private final Waypoint POINT1 = new Waypoint(-20,50 , 90);
+//    private final Waypoint POINT2_START = new Waypoint(-20,50 , 90);
+//    private final Waypoint POINT2 = new Waypoint(10, 30, 140);
+//    private final Waypoint POINT3_START = new Waypoint(10, 30, -140);
+//    private final Waypoint POINT3 = new Waypoint(100, 55, -140);
+
+    // Posição dos pods em relação ao centro do robô (valores em mm convertidos para pol)
+    private static final double X_POD_OFFSET = -14.5 / 25.4;
+    private static final double Y_POD_OFFSET = -2.5 / 25.4;
+
+    // ------------------ AJUSTES DO CONTROLE (precisam de tuning no robô) ------------------
+    private static final double POS_TOLERANCE = 0.3;     // pol
+    private static final double ANGLE_TOLERANCE = 2.0;   // graus
+    private static final double MAX_DRIVE_POWER = 0.5;
+    private static final double MAX_TURN_POWER = 0.4;
+    private static final double DRIVE_TIMEOUT = 5.0;     // s, segurança para não travar num ponto
+    private static final double DRIVE_TIMEmax = 10.0;    // s, timeout do trecho longo (POINT2)
+
+    // Ordem dos ganhos: kP, kI, kD, limite da integral
+    private final PID forwardPid = new PID(0.4,0,0,0);
+    private final PID strafePid = new PID(0.5,0,0,0);
+    private final PID turnPid = new PID(0.25,0,0,0);
+
+    // ------------------ TRAVA DE MIRA (LIMELIGHT) ------------------
+    private Limelight3A limelight;
+
+    // Mesmas tags do TeleOp (ajuste para a tag do gol vermelho se for diferente)
+    private final int[] TAG_IDS = {35, 36, 44, 43};
+
+    private static final double LL_TOLERANCE_DEG = 2;   // erro angular aceito
+    private static final double LL_HOLD_TIME = 0.2;     // s dentro da tolerância para considerar travado
+    private static final double LL_TIMEOUT = 3.0;       // s, se não achar/alinhar, segue mesmo assim
+    private static final double LL_MIN_TURN_POWER = 0.2;// vence o atrito perto do alvo
+    private static final double LL_MAX_TURN_POWER = 0.35;
+    private static final int LL_MAX_STALENESS_MS = 150; // descarta leituras mais antigas que isso
+
+    // Sentido do giro. Se o robô girar PARA LONGE da tag, troque para -1.
+    private static final double LL_TURN_SIGN = 1.0;
+
+    private final PID llTurnPid = new PID(0.25, 0.0007, 0.001, 10);
+
+    private boolean tagVisible = false;
+    private double tagTx = 0;
+    private int tagId = -1;
+
+    // ------------------ CONTROLE DE RPM DO LANÇADOR (LC) ------------------
+    private final double TICKS_PER_REV = 560.0;   // ticks do encoder por volta
+    private final double TARGET_RPM = 90;
+
+    // Ganhos do PID de RPM: copie os mesmos que você usa no TeleOp
+    private final double rpmKp = 0.25;
+    private final double rpmKi = 0.001;
+    private final double rpmKd = 0;
+
+    private double launcherTargetRPM = 0;   // 0 = lançador em repouso
+    private double rpmIntegral = 0;
+    private double rpmPreviousError = 0;
+    private double rpmPreviousTime = 0;
+    private double currentRPM = 0;
+
+    // ------------------ HARDWARE ------------------
+    // FL/FR/BL/BR: tração | LC: lançador | CO e BF: alimentação das bolas | SG: servo trava
+    private Servo SG;
+    private DcMotorEx FL, FR, BL, BR, LC, CO, BF;
+    private GoBildaPinpointDriver pinpoint;
+
+    // Pose atual (atualizada todo ciclo)
+    private double robotX, robotY, robotHeading;
+
+    private boolean headingDone = false;   // true quando o heading do ponto atual já foi atingido
+
+    // ------------------ MÉTODO PRINCIPAL ------------------
+    @Override
+    public void runOpMode() throws InterruptedException {
+
+        // Mapeia motores e servo
+        FL = hardwareMap.get(DcMotorEx.class, "FL");
+        FR = hardwareMap.get(DcMotorEx.class, "FR");
+        BL = hardwareMap.get(DcMotorEx.class, "BL");
+        BR = hardwareMap.get(DcMotorEx.class, "BR");
+        CO = hardwareMap.get(DcMotorEx.class, "CO");
+        LC = hardwareMap.get(DcMotorEx.class, "LC");
+        BF = hardwareMap.get(DcMotorEx.class, "BF");
+        SG = hardwareMap.get(Servo.class, "SG");
+
+        // Direções
+        FL.setDirection(DcMotor.Direction.FORWARD);
+        BL.setDirection(DcMotor.Direction.FORWARD);
+        BR.setDirection(DcMotor.Direction.REVERSE);
+        FR.setDirection(DcMotor.Direction.REVERSE);
+
+        CO.setDirection(DcMotorEx.Direction.FORWARD);
+        BF.setDirection(DcMotorEx.Direction.REVERSE);
+        LC.setDirection(DcMotorEx.Direction.FORWARD);
+
+        // Tração: a posição vem dos pods, então não precisa do PID de velocidade do encoder
+        FL.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        FR.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        BL.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        BR.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+
+        BF.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        CO.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+
+        // LC sem o PID de velocidade da SDK, porque o PID de RPM é nosso (o encoder continua lendo)
+        LC.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+
+        FL.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        FR.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        BL.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        BR.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        BF.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        LC.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        CO.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+
+        SG.setPosition(0.57);   // servo fechado
+
+        // Limelight
+        limelight = hardwareMap.get(Limelight3A.class, "limelight");
+        limelight.setPollRateHz(100);
+        limelight.start();
+
+        // Pinpoint (pods)
+        pinpoint = hardwareMap.get(GoBildaPinpointDriver.class, "pinpoint");
+        pinpoint.setOffsets(X_POD_OFFSET, Y_POD_OFFSET, DistanceUnit.INCH);
+        pinpoint.setEncoderResolution(GoBildaPinpointDriver.GoBildaOdometryPods.goBILDA_4_BAR_POD);
+        pinpoint.setEncoderDirections(
+                GoBildaPinpointDriver.EncoderDirection.FORWARD,   // pod X
+                GoBildaPinpointDriver.EncoderDirection.REVERSED   // pod Y
+        );
+        pinpoint.resetPosAndIMU();   // calibra o IMU interno: robô parado!
+        sleep(300);                  // o reset leva ~300 ms; sem isso o setPosition pode ser ignorado
+
+        pinpoint.setPosition(new Pose2D(
+                DistanceUnit.INCH, START.x, START.y,
+                AngleUnit.DEGREES, START.heading));
+
+        // Mostra a pose durante o init (ótimo para conferir se os pods estão certos)
+        while (!isStarted() && !isStopRequested()) {
+            updatePose();
+            telemetry.addLine("Pronto. Não mexa no robô.");
+            telemetry.addData("x", robotX);
+            telemetry.addData("y", robotY);
+            telemetry.addData("heading", robotHeading);
+            telemetry.update();
+        }
+
+        waitForStart();
+        enterState(State.LAUNCH);
+
+        // Loop principal: nenhum estado bloqueia, cada um só avança quando sua condição é atendida
+        while (opModeIsActive()) {
+            updatePose();
+            updateLauncherRPM();   // roda todo ciclo, em qualquer estado
+
+            switch (state) {
+
+                case LAUNCH:   // lança a bola parado na posição inicial
+                    if (runLaunch()) {
+                        enterState(State.COLETA);
+                    }
+                    break;
+
+                case COLETA:   // por enquanto só anda até POINT1 (não chama runColeta)
+                    if (driveTo(POINT1) || stateTimer.seconds() > DRIVE_TIMEOUT) {
+                        enterState(State.GO_POINT2_START);
+                    }
+                    break;
+
+
+                case GO_POINT2_START:
+                    if (driveTo(POINT2_START) || stateTimer.seconds() > DRIVE_TIMEOUT) {
+                        enterState(State.GO_POINT2);
+                    }
+                    break;
+
+                case GO_POINT2:
+                    if (driveTo(POINT2) || stateTimer.seconds() > DRIVE_TIMEmax) {
+                        enterState(State.DONE);
+                    }
+                    break;
+
+                // Estados desativados: terceiro ponto, mira e segundo lançamento
+//
+//                case GO_POINT3_START:
+//                    if (driveTo(POINT3_START) || stateTimer.seconds() > DRIVE_TIMEOUT) {
+//                        enterState(State.GO_POINT3);
+//                    }
+//                    break;
+//
+//                case GO_POINT3:
+//                    if (driveTo(POINT3) || stateTimer.seconds() > DRIVE_TIMEOUT) {
+//                        enterState(State.ALIGN);
+//                    }
+//                    break;
+//
+//                case ALIGN:
+//                    // Gira até a tag ficar centralizada e segura por LL_HOLD_TIME.
+//                    // Se não achar a tag a tempo, segue para o lançamento mesmo assim.
+//                    if (alignToTag()) {
+//                        if (alignHoldTimer.seconds() >= LL_HOLD_TIME) {
+//                            enterState(State.LAUNCH2);
+//                        }
+//                    } else {
+//                        alignHoldTimer.reset();
+//                    }
+//                    if (stateTimer.seconds() > LL_TIMEOUT) {
+//                        enterState(State.LAUNCH2);
+//                    }
+//                    break;
+//                case LAUNCH2:
+//                    alignToTag();
+//                    if (runLaunch()) {
+//                        enterState(State.COLETA);
+//                    }
+//                    break;
+
+
+                case DONE:
+                    stopDrive();
+                    break;
+            }
+
+            telemetry.addData("state", state);
+            telemetry.addData("launchStep", launchStep);
+            telemetry.addData("launchStep2", launchStep2);
+            telemetry.addData("RPM desejada", launcherTargetRPM);
+            telemetry.addData("RPM atual", currentRPM);
+            telemetry.addData("tag visível", tagVisible);
+            telemetry.addData("tag ID", tagId);
+            telemetry.addData("tag tx", tagTx);
+            telemetry.addData("x", robotX);
+            telemetry.addData("y", robotY);
+            telemetry.addData("heading", robotHeading);
+            telemetry.update();
+        }
+
+        // Fim do OpMode: desliga tudo
+        stopDrive();
+        stopLaunchers();
+        BF.setPower(0);
+        limelight.stop();
+    }
+
+    // ========================================================================
+    // === CONTROLE DE ESTADOS ===
+    // ========================================================================
+
+    // Toda troca de estado passa por aqui: para a tração e zera PIDs, etapas e timers
+    private void enterState(State next) {
+        stopDrive();
+        forwardPid.reset();
+        strafePid.reset();
+        turnPid.reset();
+        llTurnPid.reset();
+        launchStep = 0;
+        Colectstep = 0;
+        headingDone = false;
+        alignHoldTimer.reset();
+        stateTimer.reset();
+        state = next;
+    }
+
+    // ========================================================================
+    // === ODOMETRIA ===
+    // ========================================================================
+
+    private void updatePose() {
+        pinpoint.update();
+        robotX = pinpoint.getPosX(DistanceUnit.INCH);
+        robotY = pinpoint.getPosY(DistanceUnit.INCH);
+        robotHeading = pinpoint.getHeading(AngleUnit.DEGREES);
+    }
+
+    // ========================================================================
+    // === TRAVA DE MIRA COM A LIMELIGHT (não bloqueante: chamar todo ciclo) ===
+    // Só gira o robô (sem andar). Retorna true quando a tag está dentro da tolerância.
+    // Se não houver tag válida, para o robô e retorna false.
+    // ========================================================================
+
+    private boolean alignToTag() {
+        LLResult result = limelight.getLatestResult();
+        LLResultTypes.FiducialResult tag = findAllowedTag(result);
+
+        if (tag == null) {
+            tagVisible = false;
+            tagId = -1;
+            llTurnPid.reset();
+            stopDrive();
+            return false;
+        }
+
+        tagVisible = true;
+        tagId = tag.getFiducialId();
+        tagTx = tag.getTargetXDegrees();   // ângulo horizontal até a tag (0 = centralizada)
+
+        if (Math.abs(tagTx) <= LL_TOLERANCE_DEG) {
+            stopDrive();
+            return true;
+        }
+
+        double error = tagTx * LL_TURN_SIGN;
+        double turn = llTurnPid.calculate(error);
+        turn += Math.signum(error) * LL_MIN_TURN_POWER;   // potência mínima para vencer o atrito
+        turn = clamp(turn, -LL_MAX_TURN_POWER, LL_MAX_TURN_POWER);
+
+        // Mesma convenção do driveTo: turn + = anti-horário
+        FL.setPower(-turn);
+        BL.setPower(-turn);
+        FR.setPower(turn);
+        BR.setPower(turn);
+        return false;
+    }
+
+    // Entre as tags permitidas, retorna a mais próxima do centro da imagem (ou null)
+    private LLResultTypes.FiducialResult findAllowedTag(LLResult result) {
+        if (result == null
+                || !result.isValid()
+                || result.getStaleness() > LL_MAX_STALENESS_MS) {
+            return null;
+        }
+
+        LLResultTypes.FiducialResult bestTag = null;
+        double smallestTx = Double.POSITIVE_INFINITY;
+
+        for (LLResultTypes.FiducialResult tag : result.getFiducialResults()) {
+            boolean allowed = false;
+            for (int id : TAG_IDS) {
+                if (tag.getFiducialId() == id) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (allowed) {
+                double tx = Math.abs(tag.getTargetXDegrees());
+                if (tx < smallestTx) {
+                    smallestTx = tx;
+                    bestTag = tag;
+                }
+            }
+        }
+        return bestTag;
+    }
+
+    // ========================================================================
+    // === MOVIMENTO ATÉ UM PONTO (não bloqueante: chamar todo ciclo) ===
+    // Primeiro gira até o heading do alvo, depois anda até (x, y).
+    // Retorna true quando a posição está dentro da tolerância.
+    // ========================================================================
+    private boolean driveTo(Waypoint target) {
+        double dx = target.x - robotX;
+        double dy = target.y - robotY;
+        double dist = Math.hypot(dx, dy);
+        double headingError = normalizeAngle(target.heading - robotHeading);
+
+        // ---------- FASE 1: só o heading ----------
+        if (!headingDone) {
+            if (Math.abs(headingError) < ANGLE_TOLERANCE) {
+                headingDone = true;
+                stopDrive();
+                forwardPid.reset();   // começa a fase 2 sem integral acumulada
+                strafePid.reset();
+                turnPid.reset();
+            } else {
+                double turn = clamp(turnPid.calculate(headingError),
+                        -MAX_TURN_POWER, MAX_TURN_POWER);
+
+                // Gira no lugar (turn + = anti-horário)
+                FL.setPower(-turn);
+                BL.setPower(-turn);
+                FR.setPower(turn);
+                BR.setPower(turn);
+
+                telemetry.addData("fase", "HEADING");
+                telemetry.addData("erro heading", "%.1f", headingError);
+                return false;
+            }
+        }
+
+        // ---------- FASE 2: anda até o ponto (corrigindo o heading) ----------
+        if (dist < POS_TOLERANCE) {
+            stopDrive();
+            return true;
+        }
+
+        // Converte o erro do referencial do campo para o referencial do robô
+        double h = Math.toRadians(robotHeading);
+        double forwardError = dx * Math.cos(h) + dy * Math.sin(h);
+        double strafeError = -dx * Math.sin(h) + dy * Math.cos(h);   // + = esquerda
+
+        double forward = forwardPid.calculate(forwardError);
+        double strafe = strafePid.calculate(strafeError);
+        double turn = clamp(turnPid.calculate(headingError), -MAX_TURN_POWER, MAX_TURN_POWER);
+
+        // Mistura mecanum
+        double fl = forward - strafe - turn;
+        double bl = forward + strafe - turn;
+        double fr = forward + strafe + turn;
+        double br = forward - strafe + turn;
+
+        // Reduz todas as rodas na mesma proporção para respeitar o limite sem mudar a direção
+        double max = Math.max(Math.max(Math.abs(fl), Math.abs(bl)),
+                Math.max(Math.abs(fr), Math.abs(br)));
+
+        if (max > MAX_DRIVE_POWER) {
+            double scale = MAX_DRIVE_POWER / max;
+            fl *= scale;
+            bl *= scale;
+            fr *= scale;
+            br *= scale;
+        }
+
+        FL.setPower(fl);
+        BL.setPower(bl);
+        FR.setPower(fr);
+        BR.setPower(br);
+
+        telemetry.addData("fase", "POSIÇÃO");
+        telemetry.addData("alvo", "%.1f, %.1f, %.1f", target.x, target.y, target.heading);
+        telemetry.addData("erro", "f=%.1f s=%.1f h=%.1f", forwardError, strafeError, headingError);
+        return false;
+    }
+
+
+    // Liga a coleta e retorna true após 2 s (ainda não é usada no fluxo)
+    private boolean runColeta() {
+        switch (Colectstep) {
+
+            case 0: // liga os motores de coleta
+                BF.setPower(0.57);
+                CO.setPower(0.75);
+                SG.setPosition(0.57);
+                stepTimer.reset();
+                Colectstep = 1;
+                break;
+
+            case 1: // espera 2 s
+                if (stepTimer.seconds() >= 2) {
+                    stepTimer.reset();
+                    Colectstep = 2;
+                }
+                break;
+
+        }
+        return Colectstep == 2;
+    }
+
+    // ========================================================================
+    // === LANÇAMENTO AUTOMÁTICO ===
+    // Sequência por tempo (~4 s no total). Retorna true quando termina.
+    // ========================================================================
+
+    private boolean runLaunch() {
+        switch (launchStep) {
+
+            case 0: // liga alimentação e lançador, com o servo fechado
+                BF.setPower(0.57);
+                CO.setPower(0.75);
+                SG.setPosition(0.57);
+                launcherTargetRPM = TARGET_RPM;
+                stepTimer.reset();
+                launchStep = 1;
+                break;
+
+            case 1: // após 2 s de aceleração, abre o servo e lança
+                if (stepTimer.seconds() >= 2) {
+                    SG.setPosition(0.52);
+                    stepTimer.reset();
+                    launchStep = 2;
+                }
+                break;
+
+            case 2: // após mais 2 s, para LC e CO e fecha o servo
+                if (stepTimer.seconds() >= 2.0) {
+                    stopLaunchers();
+                    SG.setPosition(0.57);
+                    stepTimer.reset();
+                    launchStep = 3;
+                }
+                break;
+
+        }
+        return launchStep == 3;
+    }
+
+    // Igual ao runLaunch, mas com contador próprio (não usado; enterState não zera launchStep2)
+    private boolean runLaunch2() {
+        switch (launchStep2) {
+
+            case 0:
+                BF.setPower(0.57);
+                CO.setPower(0.75);
+                SG.setPosition(0.57);
+                launcherTargetRPM = TARGET_RPM;
+                stepTimer.reset();
+                launchStep2 = 1;
+                break;
+
+            case 1:
+                if (stepTimer.seconds() >= 2) {
+                    SG.setPosition(0.52);
+                    stepTimer.reset();
+                    launchStep2 = 2;
+                }
+                break;
+
+            case 2:
+                if (stepTimer.seconds() >= 2.0) {
+                    stopLaunchers();
+                    SG.setPosition(0.57);
+                    stepTimer.reset();
+                    launchStep2 = 3;
+                }
+                break;
+
+        }
+        return launchStep2 == 3;
+    }
+
+    // ========================================================================
+    // === AUXILIARES ===
+    // ========================================================================
+
+    private void stopDrive() {
+        FL.setPower(0);
+        FR.setPower(0);
+        BL.setPower(0);
+        BR.setPower(0);
+    }
+
+    // Para LC e CO (BF continua girando). No loop, o LC volta para 0.20 em updateLauncherRPM
+    private void stopLaunchers() {
+        launcherTargetRPM = 0;
+        LC.setPower(0);
+        CO.setPower(0);
+    }
+
+    // =============================================================
+    // CONTROLE PID DE RPM DO LANÇADOR
+    // =============================================================
+
+    // Chamar todo ciclo: com alvo > 0 usa o PID; com alvo 0 mantém o LC em 0.20
+    private void updateLauncherRPM() {
+        double velocityTPS = LC.getVelocity();   // ticks por segundo
+        currentRPM = Math.abs(velocityTPS) * 60.0 / TICKS_PER_REV;
+        double pidPower = calculatePID(launcherTargetRPM, currentRPM);
+
+        if (launcherTargetRPM > 0) {
+            LC.setPower(pidPower);
+        } else {
+            LC.setPower(0.20);
+            // zera o PID para não carregar integral para o próximo lançamento
+            rpmIntegral = 0;
+            rpmPreviousError = 0;
+            rpmPreviousTime = 0;
+        }
+    }
+
+    // Retorna a potência do LC, limitada entre 0 e 1
+    public double calculatePID(double targetRPM, double currentRPM) {
+
+        double currentTime = System.nanoTime() / 1e9;
+        double dt = currentTime - rpmPreviousTime;
+
+        double error = targetRPM - currentRPM;
+
+        if (dt > 0 && dt < 0.5) {
+
+            rpmIntegral += error * dt;
+
+            // Limite da integral
+            rpmIntegral = Math.max(-200, Math.min(200, rpmIntegral));
+
+            double derivative = (error - rpmPreviousError) / dt;
+
+            double output =
+                    rpmKp * error
+                            + rpmKi * rpmIntegral
+                            + rpmKd * derivative;
+
+            rpmPreviousError = error;
+            rpmPreviousTime = currentTime;
+
+            return Math.max(0, Math.min(1, output));
+        }
+
+        // Primeira chamada ou intervalo longo demais: usa só o termo P
+        rpmPreviousError = error;
+        rpmPreviousTime = currentTime;
+
+        return Math.max(0, Math.min(1, rpmKp * error));
+    }
+
+    // Mantém o ângulo entre -180 e 180 para girar sempre pelo caminho mais curto
+    private static double normalizeAngle(double angle) {
+        while (angle > 180) angle -= 360;
+        while (angle < -180) angle += 360;
+        return angle;
+    }
+
+    private static double clamp(double v, double min, double max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    // ------------------ CLASSE INTERNA PID ------------------
+    private static class PID {
+        private final double kP, kI, kD, integralLimit;
+        private double integral, previousError, previousTime;
+        private boolean first = true;
+
+        PID(double kP, double kI, double kD, double integralLimit) {
+            this.kP = kP;
+            this.kI = kI;
+            this.kD = kD;
+            this.integralLimit = integralLimit;
+        }
+
+        void reset() {
+            integral = 0;
+            previousError = 0;
+            first = true;
+        }
+
+        double calculate(double error) {
+            double now = System.nanoTime() / 1e9;
+            double output = kP * error;
+
+            // I e D só a partir da segunda chamada, quando já existe um dt válido
+            if (!first) {
+                double dt = now - previousTime;
+                if (dt > 0) {
+                    integral = clamp(integral + error * dt, -integralLimit, integralLimit);
+                    output += kI * integral + kD * (error - previousError) / dt;
+                }
+            }
+
+            first = false;
+            previousError = error;
+            previousTime = now;
+            return output;
+        }
+    }
+}
