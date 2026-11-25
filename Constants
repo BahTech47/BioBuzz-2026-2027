@@ -1,0 +1,94 @@
+package org.firstinspires.ftc.teamcode.pedro;
+
+import com.pedropathing.algorithm.Foresight;
+import com.pedropathing.algorithm.ForesightConfig;
+import com.pedropathing.controllers.Controller;
+import com.pedropathing.follower.Follower;
+import com.pedropathing.math.Matrix;
+import com.pedropathing.math.Vector2D;
+import com.pedropathing.revhub.drivetrains.CoaxialPodConfig;
+import com.pedropathing.revhub.drivetrains.Mecanum;
+import com.pedropathing.revhub.drivetrains.MecanumConfig;
+import com.pedropathing.revhub.drivetrains.SwerveConfig;
+import com.pedropathing.revhub.localizers.PinpointConfig;
+import com.pedropathing.revhub.localizers.PinpointLocalizer;
+import com.qualcomm.hardware.gobilda.GoBildaPinpointDriver;
+import com.qualcomm.robotcore.hardware.DcMotorSimple;
+import com.qualcomm.robotcore.hardware.HardwareMap;
+
+import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
+
+/**
+ * Constantes do Pedro Pathing: tração, localização, algoritmo (Foresight)
+ * e criação do Follower.
+ */
+public class Constants {
+    // ------------------ TRAÇÃO MECANUM ------------------
+    // Nomes iguais aos do hardwareMap; direções ajustadas para potência + andar para frente
+    public static MecanumConfig drivetrainConfig = new MecanumConfig(c -> {
+        c.frontLeftName.set("FL");
+        c.frontRightName.set("FR");
+        c.backLeftName.set("BL");
+        c.backRightName.set("BR");
+        c.frontLeftDirection.set(DcMotorSimple.Direction.FORWARD);
+        c.frontRightDirection.set(DcMotorSimple.Direction.REVERSE);
+        c.backLeftDirection.set(DcMotorSimple.Direction.FORWARD);
+        c.backRightDirection.set(DcMotorSimple.Direction.REVERSE);
+    });
+
+    // ------------------ LOCALIZAÇÃO (goBILDA Pinpoint) ------------------
+    public static PinpointConfig localizerConfig = new PinpointConfig(c -> {
+        c.name.set("pinpoint");
+        c.podType.set(GoBildaPinpointDriver.GoBildaOdometryPods.goBILDA_4_BAR_POD);
+        // Posição dos pods em relação ao centro de rotação (polegadas)
+        c.xPodOffset.set(1.3148789893923785);
+        c.yPodOffset.set(0.20289620076577497);
+        // X deve aumentar para frente e Y para a esquerda
+        c.xPodDirection.set(GoBildaPinpointDriver.EncoderDirection.FORWARD);
+        c.yPodDirection.set(GoBildaPinpointDriver.EncoderDirection.REVERSED);
+        c.globalDistanceUnit.set(DistanceUnit.INCH);
+        c.offsetUnits.set(DistanceUnit.INCH);
+    });
+
+    // ------------------ FORESIGHT (valores de tuning deste robô) ------------------
+    public static ForesightConfig foresightConfig = new ForesightConfig(
+            c -> {
+                // Ganhos P de translação: primary para erros grandes, secondary para erros pequenos
+                Controller primaryTranslationalForward = Controller.proportional(0.6175275232293947);
+                Controller secondaryTranslationalForward = Controller.proportional(0.228159919193944);
+                Controller primaryTranslationalLateral = Controller.proportional(1.996524892750157);
+                Controller secondaryTranslationalLateral = Controller.proportional(1.1071358792514039);
+
+                // Troca do secondary para o primary no limiar 2.5
+                c.forwardTranslational.set(Controller.piecewise(secondaryTranslationalForward).put(2.5, primaryTranslationalForward));
+                c.strafeTranslational.set(Controller.piecewise(secondaryTranslationalLateral).put(2.5, primaryTranslationalLateral));
+
+                // Feedforwards (proporcionais ao alvo) de movimento e frenagem
+                c.coast.set(Controller.proportionalFeedforward(0.013160914901497605));
+                c.brake.set(Controller.proportionalFeedforward(0.011186777666272964));
+
+                // Correção de heading e previsão de frenagem no giro
+                c.headingFeedback.set(Controller.proportional(0.4882019262525));
+                c.headingBrakeCoefficients.set(Vector2D.cartesian(0.20077585150710972, -0.013336765850497142));
+
+                // Modelo da distância de frenagem: termos linear e quadrático (frente, lateral)
+                c.linearBrakeCoefficients.set(Matrix.diag(0.035746774576698365, 0.17325957485865529));
+                c.quadraticBrakeCoefficients.set(Matrix.diag(0.002421111231188304, -0.0010464033117128285));
+
+                // Limites medidos no robô: velocidade máxima e desaceleração natural
+                c.maxAchievableForwardVelocity.set(72.29788180796919);
+                c.maxAchievableStrafeVelocity.set(61.83545099218911);
+                c.naturalForwardDeceleration.set(58.01000119035339);
+                c.naturalStrafeDeceleration.set(97.70574275370288);
+            }
+    );
+
+    // Monta o Follower; use nos OpModes: Constants.create(hardwareMap)
+    public static Follower create(HardwareMap h) {
+        return new Follower(
+                new PinpointLocalizer(h, localizerConfig),
+                new Mecanum(h, drivetrainConfig),
+                new Foresight(foresightConfig)
+        );
+    }
+}
